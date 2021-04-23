@@ -1,0 +1,182 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+use English;
+use Time::HiRes qw/gettimeofday tv_interval/;
+
+STDOUT->autoflush( 1 );
+
+# collect [-i interval] [-c community] [-h destination] [-d delimiter]
+#
+# /Foo/App1
+
+my $community = "public";
+my $probe_interval = 5;
+my $poll_host_address = "127.0.0.1";
+my @partition_set = ();     # empty list means "all partitions"
+my $delimiter = "\t";
+
+GetOptions(
+    "i=i"       => \$probe_interval,
+    "c=s"       => \$community,
+    "h=s"       => \$poll_host_address,
+    "p=s"       => \@partition_set,
+    "d=s"       => \$delimiter,
+) or die;
+
+$delimiter = ($delimiter eq '\t' ? "\t" : ($delimiter eq '\n' ? "\n" : $delimiter));
+
+my $handler = Local::SnmpDataHandler->new( poll_host_address => $poll_host_address, community => $community );
+
+print join( $delimiter, $handler->column_names ) . "\n";
+
+my $t0 = [gettimeofday];
+$handler->generate_baseline
+    or die "Failed on baseline generation: $@\n";
+
+while (1) {
+    my $results_ar = $handler->collect_data
+        or do { warn "Failed snmpbulkwalk: $@\n"; next; };
+
+    my $t1 = [gettimeofday];
+    my $data_rows_ar = $handler->process_data_set( data_set => $results_ar, milliseconds_since_last_poll => tv_interval( $t0, $t1 ) * 1000 );
+
+    foreach my $row (@{ $data_rows_ar }) {
+        print join( $delimiter, @{ $row } ) . "\n";
+    }
+
+    $t0 = $t1;
+    sleep $probe_interval;
+}
+
+
+package Local::SnmpDataHandler;
+
+use strict;
+use warnings;
+
+use FileHandle;
+
+use constant {
+    TOTAL_CONN_COUNT => 0,
+    CLIENT_BYTES_IN  => 1,
+    CLIENT_BYTES_OUT => 2,
+
+    CONNECTIONS_PER_SECOND    => 0,
+    THROUGHPOUT_THIS_INTERVAL => 1,
+};
+
+# accumulated_stats => {
+#    $partition => {
+#       $vs_name => {
+#           max_cc => $m,
+#           current_cycle_data => [$total_conn_count, $client_bytes_in, $client_bytes_out],
+#           prev_cycle_data    => [$total_conn_count, $client_bytes_in, $client_bytes_out],
+#           deltas             => [$total_cc_delta,   $client_b_in_delta, $client_b_out_delta],
+#       }
+#    }
+# }
+sub new {
+    my $class = shift;
+    my %params = @_;
+
+    return bless {
+        target_ip => $params{poll_host_address},
+        community => $params{community},
+        accumulated_stats => {},
+    }, $class;
+}
+
+sub generate_baseline {
+    my $self = shift;
+    my $data_ar = $self->collect_data
+        or return undef;
+    $self->process_data_set( data_set => $data_ar, milliseconds_since_last_poll => 0 );
+    return 1;
+}
+
+sub column_names {
+    my $self = shift;
+    return ("Partition", "VS Name", "Max CC", "CPS this Interval", "Client Bytes In", "Client Bytes Out", "Throughput this Interval");
+}
+
+sub collect_data {
+    my $self = shift;
+
+    my $ph = FileHandle->new( qq[/bin/snmpbulkwalk -c "$self->{community}" $self->{target_ip} F5-BIGIP-LOCAL-MIB::ltmVirtualServStat |] )
+        or do { $@ = $!; return undef };
+
+    my @results;
+    while (<$ph>) {
+        if (m[^F5-BIGIP-LOCAL-MIB::ltmVirtualServStat([A-Za-z0-9_-]+)\.\"/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)\" = \S+: (\d+)$]) {
+            my ($entry_name, $partition, $vs_name, $value) = ($1, $2, $3, $4);
+            push @results, [$entry_name, $partition, $vs_name, $value];
+        }
+    }
+
+    close $ph;
+
+    return \@results;
+}
+
+sub process_data_set {
+    my $self = shift;
+    my %params = @_;
+
+    my $current_interval = $params{milliseconds_since_last_poll};
+
+    my @processed_data_rows;
+
+    foreach my $row (@{ $params{data_set} }) {
+        my ($entry_name, $partition, $vs_name, $value) = @{ $row };
+
+        if (!exists $self->{accumulated_stats}->{$partition} || !exists $self->{accumulated_stats}->{$partition}->{$vs_name}) {
+            $self->{accumulated_stats}->{$partition}->{$vs_name} = {
+                max_cc => 0,
+                current_cycle_data => [0, 0, 0],
+                prev_cycle_data    => [0, 0, 0],
+                deltas             => [0, 0, 0],
+            };
+        }
+
+        if ($entry_name eq "ClientBytesIn") {
+            my $most_recently_collected_previous_value = $self->{accumulated_stats}->{$partition}->{$vs_name}->{current_cycle_data}->[CLIENT_BYTES_IN];
+            $self->{accumulated_stats}->{$partition}->{$vs_name}->{prev_cycle_data}->[CLIENT_BYTES_IN] = $most_recently_collected_previous_value;
+            $self->{accumulated_stats}->{$partition}->{$vs_name}->{current_cycle_data}->[CLIENT_BYTES_IN] = $value;
+            $self->{accumulated_stats}->{$partition}->{$vs_name}->{deltas}->[CLIENT_BYTES_IN] = $value - $most_recently_collected_previous_value;
+        }
+        elsif ($entry_name eq "ClientBytesOut") {
+            my $most_recently_collected_previous_value = $self->{accumulated_stats}->{$partition}->{$vs_name}->{current_cycle_data}->[CLIENT_BYTES_OUT];
+            $self->{accumulated_stats}->{$partition}->{$vs_name}->{prev_cycle_data}->[CLIENT_BYTES_OUT] = $most_recently_collected_previous_value;
+            $self->{accumulated_stats}->{$partition}->{$vs_name}->{current_cycle_data}->[CLIENT_BYTES_OUT] = $value;
+            $self->{accumulated_stats}->{$partition}->{$vs_name}->{deltas}->[CLIENT_BYTES_OUT] = $value - $most_recently_collected_previous_value;
+        }
+        elsif ($entry_name eq "ClientTotConns") {
+            my $most_recently_collected_previous_value = $self->{accumulated_stats}->{$partition}->{$vs_name}->{current_cycle_data}->[TOTAL_CONN_COUNT];
+            $self->{accumulated_stats}->{$partition}->{$vs_name}->{prev_cycle_data}->[TOTAL_CONN_COUNT] = $most_recently_collected_previous_value;
+            $self->{accumulated_stats}->{$partition}->{$vs_name}->{current_cycle_data}->[TOTAL_CONN_COUNT] = $value;
+            $self->{accumulated_stats}->{$partition}->{$vs_name}->{deltas}->[TOTAL_CONN_COUNT] = $value - $most_recently_collected_previous_value;
+        }
+        elsif ($entry_name eq "ClientMaxConns") {
+            $self->{accumulated_stats}->{$partition}->{$vs_name}->{max_cc} = $value;
+        }
+    }
+
+    foreach my $partition (sort keys %{ $self->{accumulated_stats} }) {
+        foreach my $vs_name (sort keys %{ $self->{accumulated_stats}->{$partition} }) {
+            my $max_cc                 = $self->{accumulated_stats}->{$partition}->{$vs_name}->{max_cc};
+            my $total_conn_count_delta = $self->{accumulated_stats}->{$partition}->{$vs_name}->{deltas}->[TOTAL_CONN_COUNT];
+            my $client_bytes_in_delta  = $self->{accumulated_stats}->{$partition}->{$vs_name}->{deltas}->[CLIENT_BYTES_IN];
+            my $client_bytes_out_delta = $self->{accumulated_stats}->{$partition}->{$vs_name}->{deltas}->[CLIENT_BYTES_OUT];
+
+            my $cps             = ($current_interval > 0 ? $total_conn_count_delta / $current_interval * 1000 : 0);
+            my $throughput_rate = ($current_interval > 0 ? ($client_bytes_in_delta + $client_bytes_out_delta) / $current_interval * 1000 : 0);
+
+            push @processed_data_rows, [$partition, $vs_name, $max_cc, $cps, $client_bytes_in_delta, $client_bytes_out_delta, $throughput_rate];
+        }
+    }
+
+    return \@processed_data_rows;
+}
