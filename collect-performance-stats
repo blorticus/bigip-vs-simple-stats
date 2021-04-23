@@ -8,9 +8,7 @@ use Time::HiRes qw/gettimeofday tv_interval/;
 
 STDOUT->autoflush( 1 );
 
-# collect [-i interval] [-c community] [-h destination] [-d delimiter]
-#
-# /Foo/App1
+# collect [-i interval] [-c community] [-a destination_ip] [-d delimiter]
 
 my $community = "public";
 my $probe_interval = 5;
@@ -21,10 +19,13 @@ my $delimiter = "\t";
 GetOptions(
     "i=i"       => \$probe_interval,
     "c=s"       => \$community,
-    "h=s"       => \$poll_host_address,
+    "a=s"       => \$poll_host_address,
     "p=s"       => \@partition_set,
     "d=s"       => \$delimiter,
-) or die;
+    "help"      => \my $needs_help,
+) or die Syntax();
+
+die Syntax()    if $needs_help;
 
 $delimiter = ($delimiter eq '\t' ? "\t" : ($delimiter eq '\n' ? "\n" : $delimiter));
 
@@ -49,6 +50,13 @@ while (1) {
 
     $t0 = $t1;
     sleep $probe_interval;
+}
+
+
+sub Syntax {
+    my $p = $0;
+       $p =~ s|^.*//||;
+    return "$p [-i <poll_interval>] [-c <snmp_community>] [-a <ip_address_of_snmp_agent>] [-d <column_delimiter>]\n";
 }
 
 
