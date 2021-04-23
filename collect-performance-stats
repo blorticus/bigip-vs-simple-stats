@@ -99,7 +99,7 @@ sub generate_baseline {
 
 sub column_names {
     my $self = shift;
-    return ("Partition", "VS Name", "Max CC", "CPS this Interval", "Client Bytes In", "Client Bytes Out", "Throughput this Interval");
+    return ("Partition", "VS Name", "New Connections this Interval", "Max CC", "CPS this Interval", "Client Bytes In this Interval", "Client Bytes Out this Interval", "Throughput this Interval", "Interval Length (in ms)");
 }
 
 sub collect_data {
@@ -174,7 +174,7 @@ sub process_data_set {
             my $cps             = ($current_interval > 0 ? $total_conn_count_delta / $current_interval * 1000 : 0);
             my $throughput_rate = ($current_interval > 0 ? ($client_bytes_in_delta + $client_bytes_out_delta) / $current_interval * 1000 : 0);
 
-            push @processed_data_rows, [$partition, $vs_name, $max_cc, $cps, $client_bytes_in_delta, $client_bytes_out_delta, $throughput_rate];
+            push @processed_data_rows, [$partition, $vs_name, $total_conn_count_delta, $max_cc, $cps, $client_bytes_in_delta, $client_bytes_out_delta, $throughput_rate, $current_interval];
         }
     }
 
